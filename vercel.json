@@ -3,14 +3,7 @@
   "builds": [
     {
       "src": "app.py",
-<<<<<<< HEAD
       "use": "@vercel/python@3.1.0"
-=======
-      "use": "@vercel/python",
-      "config": {
-        "runtime": "python3.11"
-      }
->>>>>>> 1e44b6ea2728c1cd5b02d1afbcf7c6be3e1fd047
     }
   ],
   "routes": [
@@ -18,10 +11,5 @@
       "src": "/(.*)",
       "dest": "app.py"
     }
-<<<<<<< HEAD
   ]
-=======
-  ],
-  "buildCommand": "pip install meson && pip install -r requirements.txt"
->>>>>>> 1e44b6ea2728c1cd5b02d1afbcf7c6be3e1fd047
 }
