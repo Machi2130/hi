@@ -2,6 +2,7 @@ from flask import Flask, render_template, request
 import pandas as pd
 import os
 from werkzeug.utils import secure_filename
+from typing import Tuple, List, Dict, Optional
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -12,13 +13,13 @@ ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 class ExcelProcessor:
-    def __init__(self, output_dir=None):
+    def __init__(self, output_dir: Optional[str] = None) -> None:
         self.output_dir = output_dir or 'processed_files'
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def process_excel(self, file_path):
+    def process_excel(self, file_path: str) -> pd.DataFrame:
         try:
-            df = pd.read_excel(file_path)
+            df = pd.read_excel(file_path, engine='openpyxl')
             df.columns = df.columns.str.strip()
             df.dropna(how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
@@ -27,10 +28,10 @@ class ExcelProcessor:
         except Exception as e:
             raise Exception(f"Error processing Excel file: {str(e)}")
 
-def allowed_file(filename):
+def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def compare_excel_files(file1_path, file2_path):
+def compare_excel_files(file1_path: str, file2_path: str) -> Tuple[List[Dict], Optional[str]]:
     try:
         processor = ExcelProcessor()
         df1 = processor.process_excel(file1_path)
@@ -40,8 +41,8 @@ def compare_excel_files(file1_path, file2_path):
         df1 = df1.reindex(columns=all_columns, fill_value="")
         df2 = df2.reindex(columns=all_columns, fill_value="")
         
-        df1_str = df1.fillna("").astype(str)
-        df2_str = df2.fillna("").astype(str)
+        df1_str = df1.astype(str)
+        df2_str = df2.astype(str)
         
         differences = []
         max_rows = max(len(df1), len(df2))
@@ -98,4 +99,5 @@ def compare():
     return render_template('index.html', differences=differences)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
