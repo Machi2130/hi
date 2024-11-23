@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 # Use a serverless-compatible temporary directory for uploads
 app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit file size to 16 MB
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB file size limit
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
@@ -28,8 +28,9 @@ class ExcelProcessor:
         os.makedirs(self.output_dir, exist_ok=True)
 
     def process_excel(self, file_path: str) -> pd.DataFrame:
+        """Process an Excel file: clean and prepare the DataFrame."""
         try:
-            df = pd.read_excel(file_path, engine='openpyxl')  # Ensure compatibility with modern .xlsx files
+            df = pd.read_excel(file_path, engine='openpyxl')
             df.columns = df.columns.str.strip()
             df.dropna(how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
@@ -40,9 +41,11 @@ class ExcelProcessor:
             raise Exception(f"Error processing Excel file: {str(e)}")
 
 def allowed_file(filename: str) -> bool:
+    """Check if the uploaded file has an allowed extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def compare_excel_files(file1_path: str, file2_path: str) -> Tuple[List[Dict], Optional[str]]:
+    """Compare two Excel files and return the differences."""
     try:
         processor = ExcelProcessor()
         df1 = processor.process_excel(file1_path)
@@ -66,7 +69,7 @@ def compare_excel_files(file1_path: str, file2_path: str) -> Tuple[List[Dict], O
                 
                 if value1 != value2:
                     differences.append({
-                        'row': idx + 2,
+                        'row': idx + 2,  # Add 2 to adjust for 0-based indexing and header
                         'column': col,
                         'file1_value': value1,
                         'file2_value': value2
@@ -79,10 +82,12 @@ def compare_excel_files(file1_path: str, file2_path: str) -> Tuple[List[Dict], O
 
 @app.route('/', methods=['GET'])
 def index():
+    """Render the index page with optional differences."""
     return render_template('index.html', differences=None)
 
 @app.route('/compare', methods=['POST'])
 def compare():
+    """Handle the comparison of two Excel files."""
     try:
         if 'file1' not in request.files or 'file2' not in request.files:
             return render_template('index.html', error='Please upload both files')
@@ -96,7 +101,7 @@ def compare():
         if not (allowed_file(file1.filename) and allowed_file(file2.filename)):
             return render_template('index.html', error='Only Excel files (.xls, .xlsx) are allowed')
         
-        # Save files to temporary directory
+        # Save files to the temporary directory
         file1_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file1.filename))
         file2_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file2.filename))
         
@@ -119,5 +124,6 @@ def compare():
         return render_template('index.html', error="An unexpected error occurred. Please try again.")
 
 if __name__ == '__main__':
+    # Get the port dynamically from the environment (Vercel) or default to 10000
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
