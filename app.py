@@ -3,29 +3,40 @@ import pandas as pd
 import os
 from werkzeug.utils import secure_filename
 from typing import Tuple, List, Dict, Optional
+import logging
 
+# Initialize Flask app
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
+# Use a serverless-compatible temporary directory for uploads
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Limit file size to 16 MB
+
+# Allowed file extensions
 ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
 
+# Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class ExcelProcessor:
     def __init__(self, output_dir: Optional[str] = None) -> None:
-        self.output_dir = output_dir or 'processed_files'
+        self.output_dir = output_dir or '/tmp/processed_files'
         os.makedirs(self.output_dir, exist_ok=True)
 
     def process_excel(self, file_path: str) -> pd.DataFrame:
         try:
-            df = pd.read_excel(file_path, engine='openpyxl')
+            df = pd.read_excel(file_path, engine='openpyxl')  # Ensure compatibility with modern .xlsx files
             df.columns = df.columns.str.strip()
             df.dropna(how='all', inplace=True)
             df.reset_index(drop=True, inplace=True)
             df.fillna('', inplace=True)
             return df
         except Exception as e:
+            logger.error(f"Error processing Excel file: {e}")
             raise Exception(f"Error processing Excel file: {str(e)}")
 
 def allowed_file(filename: str) -> bool:
@@ -63,6 +74,7 @@ def compare_excel_files(file1_path: str, file2_path: str) -> Tuple[List[Dict], O
         
         return differences, None
     except Exception as e:
+        logger.error(f"Error comparing Excel files: {e}")
         return [], f"Error comparing Excel files: {str(e)}"
 
 @app.route('/', methods=['GET'])
@@ -71,33 +83,40 @@ def index():
 
 @app.route('/compare', methods=['POST'])
 def compare():
-    if 'file1' not in request.files or 'file2' not in request.files:
-        return render_template('index.html', error='Please upload both files')
-    
-    file1 = request.files['file1']
-    file2 = request.files['file2']
-    
-    if file1.filename == '' or file2.filename == '':
-        return render_template('index.html', error='No files selected')
-    
-    if not (allowed_file(file1.filename) and allowed_file(file2.filename)):
-        return render_template('index.html', error='Only Excel files (.xls, .xlsx) are allowed')
-    
-    file1_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file1.filename))
-    file2_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file2.filename))
-    
-    file1.save(file1_path)
-    file2.save(file2_path)
-    
-    differences, error = compare_excel_files(file1_path, file2_path)
-    
-    os.remove(file1_path)
-    os.remove(file2_path)
-    
-    if error:
-        return render_template('index.html', error=error)
-    
-    return render_template('index.html', differences=differences)
+    try:
+        if 'file1' not in request.files or 'file2' not in request.files:
+            return render_template('index.html', error='Please upload both files')
+        
+        file1 = request.files['file1']
+        file2 = request.files['file2']
+        
+        if file1.filename == '' or file2.filename == '':
+            return render_template('index.html', error='No files selected')
+        
+        if not (allowed_file(file1.filename) and allowed_file(file2.filename)):
+            return render_template('index.html', error='Only Excel files (.xls, .xlsx) are allowed')
+        
+        # Save files to temporary directory
+        file1_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file1.filename))
+        file2_path = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file2.filename))
+        
+        file1.save(file1_path)
+        file2.save(file2_path)
+        
+        # Compare the files
+        differences, error = compare_excel_files(file1_path, file2_path)
+        
+        # Clean up temporary files
+        os.remove(file1_path)
+        os.remove(file2_path)
+        
+        if error:
+            return render_template('index.html', error=error)
+        
+        return render_template('index.html', differences=differences)
+    except Exception as e:
+        logger.error(f"Unhandled error: {e}")
+        return render_template('index.html', error="An unexpected error occurred. Please try again.")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
