@@ -1,0 +1,1522 @@
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from tqdm.auto import tqdm
+import os
+import logging
+import json
+import re
+from collections import Counter
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from transformers import (
+    AutoTokenizer, 
+    AutoModel, 
+    AutoModelForSequenceClassification,
+    TFAutoModel,
+    TFBertModel,
+    BertTokenizer,
+    RobertaTokenizer,
+    RobertaForSequenceClassification,
+    DistilBertTokenizer,
+    DistilBertModel
+)
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+from nltk.sentiment import SentimentIntensityAnalyzer
+import nltk
+import spacy
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as VaderSentimentAnalyzer
+
+# Download necessary NLTK data
+try:
+    nltk.data.find('vader_lexicon')
+except LookupError:
+    nltk.download('vader_lexicon')
+
+try:
+    nltk.data.find('punkt')
+except LookupError:
+    nltk.download('punkt')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Set seeds for reproducibility
+def set_seeds(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+set_seeds()
+
+class EmotionFeatureExtractor:
+    """
+    Class to extract emotion-related features from text data
+    """
+    def __init__(self):
+        # Initialize sentiment analyzers
+        self.nltk_sia = SentimentIntensityAnalyzer()
+        self.vader_analyzer = VaderSentimentAnalyzer()
+        
+        # Load spaCy model for linguistic features
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except:
+            logger.info("Downloading spaCy model...")
+            os.system("python -m spacy download en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+        
+        # Emotion word lexicons with additional emotions
+        self.emotion_lexicons = {
+            'anger': ['angry', 'mad', 'furious', 'outraged', 'annoyed', 'irritated', 'enraged', 'hostile'],
+            'fear': ['afraid', 'scared', 'frightened', 'terrified', 'anxious', 'worried', 'nervous', 'panicked'],
+            'joy': ['happy', 'joyful', 'delighted', 'pleased', 'glad', 'cheerful', 'excited', 'thrilled'],
+            'sadness': ['sad', 'unhappy', 'depressed', 'gloomy', 'miserable', 'downhearted', 'heartbroken', 'grief'],
+            'disgust': ['disgusted', 'repulsed', 'revolted', 'sickened', 'appalled', 'horrified', 'offended'],
+            'surprise': ['surprised', 'amazed', 'astonished', 'shocked', 'startled', 'stunned', 'bewildered']
+        }
+        
+        # Linguistic markers of mental health
+        self.mental_health_markers = {
+            'self_reference': ['I', 'me', 'my', 'mine', 'myself'],
+            'cognitive_distortion': ['always', 'never', 'everyone', 'nobody', 'everything', 'nothing', 'completely', 'totally'],
+            'uncertainty': ['maybe', 'perhaps', 'might', 'could be', 'possibly', 'not sure', 'uncertain', 'unsure'],
+            'rumination': ['keep thinking', 'can\'t stop thinking', 'obsessing', 'dwelling', 'ruminating', 'fixated'],
+            'negative_thinking': ['worst', 'terrible', 'horrible', 'awful', 'catastrophe', 'disaster', 'unbearable']
+        }
+    
+    def extract_features(self, text):
+        """
+        Extract emotion and linguistic features from text
+        
+        Args:
+            text (str): Input text
+            
+        Returns:
+            dict: Dictionary of extracted features
+        """
+        if not isinstance(text, str):
+            text = str(text)
+            
+        features = {}
+        
+        # NLTK sentiment scores
+        nltk_scores = self.nltk_sia.polarity_scores(text)
+        features.update({f'nltk_{k}': v for k, v in nltk_scores.items()})
+        
+        # VADER sentiment scores
+        vader_scores = self.vader_analyzer.polarity_scores(text)
+        features.update({f'vader_{k}': v for k, v in vader_scores.items()})
+        
+        # Process with spaCy
+        doc = self.nlp(text)
+        
+        # Linguistic features
+        features['text_length'] = len(text)
+        features['word_count'] = len([token for token in doc if not token.is_punct])
+        features['sentence_count'] = len(list(doc.sents))
+        features['avg_sentence_length'] = features['word_count'] / max(1, features['sentence_count'])
+        
+        # POS tag ratios
+        pos_counts = Counter([token.pos_ for token in doc])
+        total_tokens = max(1, len([token for token in doc if not token.is_punct]))
+        
+        for pos, count in pos_counts.items():
+            features[f'pos_ratio_{pos}'] = count / total_tokens
+        
+        # Emotional content detection
+        for emotion, words in self.emotion_lexicons.items():
+            emotion_count = sum(1 for token in doc if token.lemma_.lower() in words)
+            features[f'emotion_{emotion}'] = emotion_count / max(1, features['word_count'])
+        
+        # Mental health linguistic markers
+        for marker, words in self.mental_health_markers.items():
+            marker_count = sum(1 for token in doc if token.text.lower() in words)
+            features[f'marker_{marker}'] = marker_count / max(1, features['word_count'])
+        
+        # Subjectivity features
+        features['first_person_ratio'] = sum(1 for token in doc if token.text.lower() in ['i', 'me', 'my', 'mine', 'myself']) / max(1, features['word_count'])
+        
+        return features
+
+class FlexibleDataset(Dataset):
+    """
+    A flexible dataset class that can handle various types of data:
+    - Structured tabular data
+    - Text data
+    - Mixed data (text + features)
+    
+    With enhanced emotion and sentiment analysis
+    """
+    def __init__(self, data_path, max_length=512, tokenizer_name="distilbert-base-uncased"):
+        """
+        Initialize the dataset.
+        
+        Args:
+            data_path (str): Path to the data file (CSV or JSON)
+            max_length (int): Maximum sequence length for text
+            tokenizer_name (str): Name of the pretrained tokenizer
+        """
+        self.max_length = max_length
+        
+        # Load tokenizer for text processing
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        
+        # Initialize emotion feature extractor
+        self.emotion_extractor = EmotionFeatureExtractor()
+        
+        # Detect file type and load data
+        if data_path.endswith('.csv'):
+            self.df = pd.read_csv(data_path)
+        elif data_path.endswith('.json'):
+            with open(data_path, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.df = pd.DataFrame(data)
+            else:
+                # Handle nested JSON structures
+                self.df = pd.json_normalize(data)
+        elif data_path.endswith('.xlsx') or data_path.endswith('.xls'):
+            self.df = pd.read_excel(data_path)
+        elif data_path.endswith('.tsv'):
+            self.df = pd.read_csv(data_path, sep='\t')
+        else:
+            raise ValueError(f"Unsupported file format: {data_path}")
+        
+        logger.info(f"Loaded {len(self.df)} samples with {len(self.df.columns)} features")
+        
+        # Analyze data to determine types
+        self.analyze_data()
+        
+        # Preprocess the data
+        self.preprocess_data()
+    
+    def analyze_data(self):
+        """Analyze the dataset to identify text, categorical, and numerical features."""
+        self.text_columns = []
+        self.categorical_columns = []
+        self.numerical_columns = []
+        self.target_column = None
+        
+        # Check for common target column names
+        target_candidates = ['target', 'label', 'sentiment', 'mental_health_score', 
+                            'wellbeing', 'depression', 'anxiety', 'stress', 'emotion',
+                            'mood', 'affect', 'psychological_state', 'mental_state']
+        
+        for col in self.df.columns:
+            # Identify target column
+            if col.lower() in target_candidates and self.target_column is None:
+                self.target_column = col
+                continue
+                
+            # Sample values from the column
+            sample_values = self.df[col].sample(min(100, len(self.df))).tolist()
+            
+            # Check if column appears to contain text
+            if self.df[col].dtype == 'object':
+                # Check if this might be a text column
+                text_length = np.mean([len(str(x)) for x in sample_values if isinstance(x, str)])
+                if text_length > 20:  # Longer texts are probably actual content
+                    self.text_columns.append(col)
+                else:
+                    self.categorical_columns.append(col)
+            # Check if column is numerical
+            elif np.issubdtype(self.df[col].dtype, np.number):
+                self.numerical_columns.append(col)
+            else:
+                # Try to convert to numerical
+                try:
+                    self.df[col] = pd.to_numeric(self.df[col])
+                    self.numerical_columns.append(col)
+                except:
+                    self.categorical_columns.append(col)
+        
+        # If no target column found, try to guess based on column name
+        if self.target_column is None:
+            for col in self.df.columns:
+                if any(keyword in col.lower() for keyword in ['score', 'label', 'target', 'class', 'sentiment', 'emotion']):
+                    self.target_column = col
+                    if col in self.numerical_columns:
+                        self.numerical_columns.remove(col)
+                    elif col in self.categorical_columns:
+                        self.categorical_columns.remove(col)
+                    elif col in self.text_columns:
+                        self.text_columns.remove(col)
+                    break
+        
+        # If still no target found, use the last column
+        if self.target_column is None:
+            self.target_column = self.df.columns[-1]
+            logger.warning(f"No clear target column found, using {self.target_column} as target")
+            if self.target_column in self.numerical_columns:
+                self.numerical_columns.remove(self.target_column)
+            elif self.target_column in self.categorical_columns:
+                self.categorical_columns.remove(self.target_column)
+            elif self.target_column in self.text_columns:
+                self.text_columns.remove(self.target_column)
+        
+        logger.info(f"Text columns: {self.text_columns}")
+        logger.info(f"Categorical columns: {self.categorical_columns}")
+        logger.info(f"Numerical columns: {self.numerical_columns}")
+        logger.info(f"Target column: {self.target_column}")
+        
+        # Determine the task type (classification or regression)
+        if self.df[self.target_column].dtype == 'object' or len(self.df[self.target_column].unique()) < 10:
+            self.task_type = 'classification'
+            self.num_classes = len(self.df[self.target_column].unique())
+        else:
+            self.task_type = 'regression'
+            self.num_classes = 1
+        
+        logger.info(f"Task type: {self.task_type}, Number of classes: {self.num_classes}")
+    
+    def extract_emotion_features(self):
+        """
+        Extract emotion-related features from text data
+        """
+        if not self.text_columns:
+            return
+        
+        logger.info("Extracting emotion features from text data...")
+        
+        # Combine all text columns
+        combined_text = self.df[self.text_columns].apply(
+            lambda row: ' '.join([str(row[col]) for col in self.text_columns if pd.notna(row[col])]), 
+            axis=1
+        )
+        
+        # Extract features for each text
+        emotion_features = []
+        for text in tqdm(combined_text, desc="Extracting emotion features"):
+            features = self.emotion_extractor.extract_features(text)
+            emotion_features.append(features)
+        
+        # Convert to DataFrame
+        emotion_df = pd.DataFrame(emotion_features)
+        
+        # Add to original DataFrame
+        for col in emotion_df.columns:
+            self.df[f'emotion_{col}'] = emotion_df[col]
+            self.numerical_columns.append(f'emotion_{col}')
+        
+        logger.info(f"Added {len(emotion_df.columns)} emotion-related features")
+    
+    def preprocess_data(self):
+        """Preprocess the data for model training."""
+        # Extract emotion features if text columns exist
+        if self.text_columns:
+            self.extract_emotion_features()
+        
+        # Handle categorical columns
+        if self.categorical_columns:
+            self.df_encoded = pd.get_dummies(self.df, columns=self.categorical_columns)
+            # Get new categorical column names after one-hot encoding
+            self.encoded_categorical_columns = [col for col in self.df_encoded.columns 
+                                             if col not in self.df.columns 
+                                             and col != self.target_column
+                                             and col not in self.text_columns
+                                             and col not in self.numerical_columns]
+        else:
+            self.df_encoded = self.df.copy()
+            self.encoded_categorical_columns = []
+        
+        # Combine numerical and encoded categorical columns
+        self.feature_columns = self.numerical_columns + self.encoded_categorical_columns
+        
+        # Extract features
+        if self.feature_columns:
+            self.features = self.df_encoded[self.feature_columns].values
+            # Normalize numerical features
+            if self.numerical_columns:
+                num_features = self.df_encoded[self.numerical_columns].values
+                num_features = (num_features - np.mean(num_features, axis=0)) / (np.std(num_features, axis=0) + 1e-8)
+                self.df_encoded[self.numerical_columns] = num_features
+                self.features = self.df_encoded[self.feature_columns].values
+        else:
+            self.features = np.zeros((len(self.df), 1))  # Dummy feature if no features exist
+        
+        # Process text data
+        if self.text_columns:
+            # Combine all text columns into one text field
+            self.texts = self.df[self.text_columns].apply(
+                lambda row: ' '.join([str(row[col]) for col in self.text_columns if pd.notna(row[col])]), 
+                axis=1
+            ).tolist()
+        else:
+            self.texts = None
+        
+        # Process target
+        if self.task_type == 'classification':
+            # Convert target to numerical labels
+            self.label_mapping = {label: i for i, label in enumerate(self.df[self.target_column].unique())}
+            self.reverse_label_mapping = {i: label for label, i in self.label_mapping.items()}
+            self.labels = np.array([self.label_mapping[label] for label in self.df[self.target_column]])
+        else:
+            self.labels = self.df[self.target_column].values
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        item = {}
+        
+        # Add features if available
+        if len(self.feature_columns) > 0:
+            item['features'] = torch.tensor(self.features[idx], dtype=torch.float32)
+        
+        # Add text if available
+        if self.texts is not None:
+            text = self.texts[idx]
+            encoded_text = self.tokenizer(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            item['input_ids'] = encoded_text['input_ids'].squeeze()
+            item['attention_mask'] = encoded_text['attention_mask'].squeeze()
+        
+        # Add target
+        if self.task_type == 'classification':
+            item['label'] = torch.tensor(self.labels[idx], dtype=torch.long)
+        else:
+            item['target'] = torch.tensor(self.labels[idx], dtype=torch.float32)
+        
+        return item
+
+class EmotionContextAttention(nn.Module):
+    """
+    Custom attention mechanism for emotion and context understanding
+    """
+    def __init__(self, hidden_size, attention_size=64):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, attention_size),
+            nn.Tanh(),
+            nn.Linear(attention_size, 1),
+            nn.Softmax(dim=1)
+        )
+    
+    def forward(self, hidden_states):
+        # hidden_states: (batch_size, seq_len, hidden_size)
+        attention_weights = self.attention(hidden_states)  # (batch_size, seq_len, 1)
+        context_vector = torch.sum(attention_weights * hidden_states, dim=1)  # (batch_size, hidden_size)
+        return context_vector, attention_weights
+
+class MultiModalFusion(nn.Module):
+    """
+    Module for fusing text and tabular features with cross-attention
+    """
+    def __init__(self, text_dim, tabular_dim, fusion_dim=128):
+        super().__init__()
+        self.text_projection = nn.Linear(text_dim, fusion_dim)
+        self.tabular_projection = nn.Linear(tabular_dim, fusion_dim)
+        
+        self.cross_attention = nn.MultiheadAttention(embed_dim=fusion_dim, num_heads=4, batch_first=True)
+        
+        self.layer_norm1 = nn.LayerNorm(fusion_dim)
+        self.layer_norm2 = nn.LayerNorm(fusion_dim)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim * 2),
+            nn.GELU(),
+            nn.Linear(fusion_dim * 2, fusion_dim)
+        )
+    
+    def forward(self, text_features, tabular_features):
+        # Project features to same dimension
+        text_proj = self.text_projection(text_features).unsqueeze(1)  # [batch, 1, fusion_dim]
+        tab_proj = self.tabular_projection(tabular_features).unsqueeze(1)  # [batch, 1, fusion_dim]
+        
+        # Cross-attention mechanism
+        combined = torch.cat([text_proj, tab_proj], dim=1)  # [batch, 2, fusion_dim]
+        
+        # Self-attention
+        attn_output, _ = self.cross_attention(combined, combined, combined)
+        
+        # Residual connection and layer normalization
+        combined = self.layer_norm1(combined + attn_output)
+        
+        # Feed-forward
+        ff_output = self.feed_forward(combined)
+        combined = self.layer_norm2(combined + ff_output)
+        
+        # Average pooling for final representation
+        fused = torch.mean(combined, dim=1)  # [batch, fusion_dim]
+        
+        return fused
+
+class EmotionRecognitionModule(nn.Module):
+    """
+    Specialized module for emotion recognition from text
+    """
+    def __init__(self, input_dim, hidden_dim=128, num_emotions=7):
+        super().__init__()
+        self.emotion_classifier = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_emotions)
+        )
+        
+        # Define basic emotions
+        self.emotions = ['anger', 'disgust', 'fear', 'joy', 'sadness', 'surprise', 'neutral']
+    
+    def forward(self, features):
+        # Predict emotion probabilities
+        emotion_logits = self.emotion_classifier(features)
+        return emotion_logits
+    
+    def get_emotion_embeddings(self, emotion_logits):
+        # Convert emotion logits to embeddings
+        emotion_probs = torch.softmax(emotion_logits, dim=-1)
+        return emotion_probs
+
+class ContextualEmotionLLM(nn.Module):
+    """
+    An enhanced LLM-based model for mental health data with emotion understanding
+    and contextual awareness
+    """
+    def __init__(self, 
+                num_features=0, 
+                num_classes=2,
+                llm_model_name="bert-base-uncased",
+                hidden_dim=256,
+                dropout_rate=0.2,
+                use_emotion_module=True):
+        super().__init__()
+        
+        # LLM for text processing
+        self.llm = AutoModel.from_pretrained(llm_model_name)
+        self.llm_hidden_size = self.llm.config.hidden_size
+        
+        # Emotion recognition module
+        self.use_emotion_module = use_emotion_module
+        if use_emotion_module:
+            self.emotion_module = EmotionRecognitionModule(self.llm_hidden_size, hidden_dim=hidden_dim)
+        
+        # Custom attention mechanism for context understanding
+        self.context_attention = EmotionContextAttention(self.llm_hidden_size)
+        
+        # Feature processing for tabular data
+        self.has_features = num_features > 0
+        if self.has_features:
+            self.feature_fc = nn.Sequential(
+                nn.Linear(num_features, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            )
+            
+            # Multimodal fusion module
+            self.fusion = MultiModalFusion(self.llm_hidden_size, hidden_dim, fusion_dim=hidden_dim)
+        
+        # Combined processing dimensions
+        if use_emotion_module:
+            # Add emotion embedding dimension (7 emotions)
+            if self.has_features:
+                combined_dim = hidden_dim + 7
+            else:
+                combined_dim = self.llm_hidden_size + 7
+        else:
+            if self.has_features:
+                combined_dim = hidden_dim
+            else:
+                combined_dim = self.llm_hidden_size
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+        # Regression head
+        self.regression_head = nn.Linear(combined_dim, 1)
+    
+    def forward(self, input_ids=None, attention_mask=None, features=None, task='classification'):
+        """
+        Forward pass through the model.
+        
+        Args:
+            input_ids: Token ids (if text is available)
+            attention_mask: Attention mask (if text is available)
+            features: Tabular features (if available)
+            task: 'classification' or 'regression'
+            
+        Returns:
+            Model output
+        """
+        text_embedding = None
+        feature_embedding = None
+        
+        # Process text if provided
+        if input_ids is not None:
+            # Get LLM outputs
+            outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
+            hidden_states = outputs.last_hidden_state
+            
+            # Apply attention mechanism for better context understanding
+            text_embedding, attention_weights = self.context_attention(hidden_states)
+            
+            # Get emotion predictions if enabled
+            if self.use_emotion_module:
+                emotion_logits = self.emotion_module(text_embedding)
+                emotion_embedding = self.emotion_module.get_emotion_embeddings(emotion_logits)
+        
+        # Process features if provided
+        if features is not None and self.has_features:
+            feature_embedding = self.feature_fc(features)
+        
+        # Combine embeddings
+        if text_embedding is not None and feature_embedding is not None:
+            # Use multimodal fusion
+            combined = self.fusion(text_embedding, feature_embedding)
+            
+            # Add emotion information if available
+            if self.use_emotion_module:
+                combined = torch.cat([combined, emotion_embedding], dim=1)
+                
+        elif text_embedding is not None:
+            # Text only
+            if self.use_emotion_module:
+                combined = torch.cat([text_embedding, emotion_embedding], dim=1)
+            else:
+                combined = text_embedding
+                
+        elif feature_embedding is not None:
+            # Features only
+            combined = feature_embedding
+        else:
+            raise ValueError("No inputs provided to the model")
+        
+        # Output based on task
+        if task == 'classification':
+            return self.classifier(combined)
+        elif task == 'regression':
+            return self.regression_head(combined)
+        else:
+            raise ValueError(f"Unknown task: {task}")
+    
+    def get_emotion_predictions(self, input_ids, attention_mask):
+        """
+        Get emotion predictions for text
+        
+        Returns:
+            Dict of emotion scores
+        """
+        if not self.use_emotion_module:
+            return None
+            
+        outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state
+        text_embedding, _ = self.context_attention(hidden_states)
+        
+        emotion_logits = self.emotion_module(text_embedding)
+        emotion_probs = torch.softmax(emotion_logits, dim=-1)
+        
+        # Convert to dictionary
+        batch_size = emotion_probs.shape[0]
+        results = []
+        
+        for i in range(batch_size):
+            result = {emotion: prob.item() for emotion, prob in zip(self.emotion_module.emotions, emotion_probs[i])}
+            results.append(result)
+            
+        return results
+
+class TensorFlowBERTInterface(nn.Module):
+    """
+    Interface to use TensorFlow-based BERT models within PyTorch
+    """
+    def __init__(self, model_name="bert_en_uncased_L-12_H-768_A-12"):
+        super().__init__()
+        try:
+            # Load TF BERT model
+            self.tf_bert = hub.load(f"https://tfhub.dev/tensorflow/{model_name}/3")
+            self.preprocessor = hub.load(f"https://tfhub.dev/tensorflow/{model_name}/preprocessor/3")
+            self.output_dim = 768  # BERT base hidden size
+        except:
+            logger.warning("Failed to load TensorFlow BERT, falling back to Hugging Face BERT")
+            # Fallback to Hugging Face
+            self.tf_bert = None
+            self.bert_model = TFBertModel.from_pretrained("bert-base-uncased")
+            self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+            self.output_dim = 768
+    
+    def forward(self, texts):
+        if self.tf_bert is not None:
+            # Process with TF Hub BERT
+            text_inputs = self.preprocessor(texts)
+            with tf.device('/CPU:0'):  # Force CPU to avoid OOM with mixed TF/PyTorch
+                bert_outputs = self.tf_bert(text_inputs)
+            
+            # Convert TF tensor to PyTorch
+            pooled_output = torch.from_numpy(bert_outputs["pooled_output"].numpy())
+            return pooled_output
+        else:
+            # Fallback to Hugging Face BERT
+            inputs = self.tokenizer(texts, return_tensors="tf", padding=True, truncation=True)
+            outputs = self.bert_model(inputs)
+            pooled_output = torch.from_numpy(outputs.pooler_output.numpy())
+            return pooled_output
+
+def train_model(model, train_loader, val_loader=None, epochs=10, lr=0.0001, task='classification', 
+                use_emotional_loss=True, early_stopping_patience=3):
+    """
+    Train the mental health model with enhanced loss functions for emotion understanding.
+    
+    Args:
+        model: The model to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        epochs: Number of training epochs
+        lr: Learning rate
+        task: 'classification' or 'regression'
+        use_emotional_loss: Whether to use emotion-aware loss weighting
+        early_stopping_patience: Number of epochs to wait before early stopping
+    """
+    model = model.to(device)
+    
+    # Define loss function based on task
+    if task == 'classification':
+        criterion = nn.CrossEntropyLoss(reduction='none')  # Use 'none' to enable sample weighting
+    else:
+        criterion = nn.MSELoss(reduction='none')
+    
+    # Use different learning rates for LLM and other parts
+    llm_params = list(model.llm.parameters())
+    other_params = [p for p in model.parameters() if p not in set(llm_params)]
+    
+    optimizer = optim.AdamW([
+        {'params': llm_params, 'lr': lr/10},  # Lower learning rate for LLM
+        {'params': other_params, 'lr': lr}
+    ])
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    best_model_path = None
+    no_improvement_count = 0
+    
+    # Track metrics
+    train_losses = []
+    val_losses = []
+    metrics_history = []
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            # Move data to device
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            
+            # Forward pass
+            optimizer.zero_grad()
+            
+            if task == 'classification':
+                targets = batch['label']
+            else:
+                targets = batch['target']
+            
+            # GET MODEL # Get model inputs
+            model_inputs = {}
+            if 'input_ids' in batch:
+                model_inputs['input_ids'] = batch['input_ids']
+                model_inputs['attention_mask'] = batch['attention_mask']
+            if 'features' in batch:
+                model_inputs['features'] = batch['features']
+            
+            model_inputs['task'] = task
+            
+            # Get model outputs
+            outputs = model(**model_inputs)
+            
+            # Calculate base loss
+            if task == 'classification':
+                loss = criterion(outputs, targets)
+            else:
+                loss = criterion(outputs.squeeze(), targets)
+            
+            # Apply emotional weighting if enabled
+            if use_emotional_loss and 'input_ids' in batch and model.use_emotion_module:
+                # Get emotion predictions
+                emotion_preds = model.get_emotion_predictions(
+                    batch['input_ids'], 
+                    batch['attention_mask']
+                )
+                
+                # Calculate emotion-based weights
+                # Higher weights for samples with strong negative emotions
+                weights = torch.ones_like(loss)
+                
+                for i, emotions in enumerate(emotion_preds):
+                    # Calculate weight based on negative emotions (sadness, fear, anger)
+                    negative_score = emotions['sadness'] + emotions['fear'] + emotions['anger']
+                    # Scale weight to be between 1.0 and 2.0
+                    weight = 1.0 + min(1.0, negative_score)
+                    weights[i] = weight
+                
+                # Apply weights to loss
+                loss = loss * weights
+            
+            # Take mean for final loss
+            loss = loss.mean()
+            
+            # Backward pass and optimization
+            loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            total_loss += loss.item()
+        
+        # Calculate average training loss
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Validation
+        if val_loader is not None:
+            val_loss, metrics = evaluate_model(model, val_loader, criterion, task)
+            val_losses.append(val_loss)
+            metrics_history.append(metrics)
+            
+            # Print progress
+            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Update scheduler
+            scheduler.step(val_loss)
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                no_improvement_count = 0
+                
+                # Save model
+                if best_model_path:
+                    try:
+                        os.remove(best_model_path)
+                    except:
+                        pass
+                
+                best_model_path = f"best_model_epoch_{epoch+1}.pt"
+                torch.save(model.state_dict(), best_model_path)
+                logger.info(f"Saved best model to {best_model_path}")
+            else:
+                no_improvement_count += 1
+                
+            # Early stopping
+            if no_improvement_count >= early_stopping_patience:
+                logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        else:
+            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}")
+    
+    # Load best model if validation was used
+    if val_loader is not None and best_model_path is not None:
+        model.load_state_dict(torch.load(best_model_path))
+        logger.info(f"Loaded best model from {best_model_path}")
+    
+    # Return training history
+    history = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'metrics': metrics_history
+    }
+    
+    return model, history
+
+def evaluate_model(model, data_loader, criterion, task='classification'):
+    """
+    Evaluate the model on validation or test data
+    
+    Args:
+        model: The model to evaluate
+        data_loader: DataLoader for validation/test data
+        criterion: Loss function
+        task: 'classification' or 'regression'
+        
+    Returns:
+        tuple: (average loss, evaluation metrics)
+    """
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            # Move data to device
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            
+            # Get model inputs
+            model_inputs = {}
+            if 'input_ids' in batch:
+                model_inputs['input_ids'] = batch['input_ids']
+                model_inputs['attention_mask'] = batch['attention_mask']
+            if 'features' in batch:
+                model_inputs['features'] = batch['features']
+            
+            model_inputs['task'] = task
+            
+            # Get targets
+            if task == 'classification':
+                targets = batch['label']
+            else:
+                targets = batch['target']
+            
+            # Forward pass
+            outputs = model(**model_inputs)
+            
+            # Calculate loss
+            if task == 'classification':
+                loss = criterion(outputs, targets)
+                preds = torch.argmax(outputs, dim=1)
+            else:
+                loss = criterion(outputs.squeeze(), targets)
+                preds = outputs.squeeze()
+            
+            # Take mean for batch loss
+            loss = loss.mean()
+            total_loss += loss.item()
+            
+            # Store predictions and targets
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+    
+    # Calculate metrics
+    metrics = calculate_metrics(all_targets, all_preds, task)
+    
+    # Return average loss and metrics
+    return total_loss / len(data_loader), metrics
+
+def calculate_metrics(targets, predictions, task='classification'):
+    """
+    Calculate evaluation metrics based on the task
+    
+    Args:
+        targets: Ground truth values
+        predictions: Model predictions
+        task: 'classification' or 'regression'
+        
+    Returns:
+        dict: Dictionary of evaluation metrics
+    """
+    if task == 'classification':
+        # Classification metrics
+        conf_matrix = confusion_matrix(targets, predictions)
+        class_report = classification_report(targets, predictions, output_dict=True)
+        
+        # Extract key metrics
+        metrics = {
+            'accuracy': class_report['accuracy'],
+            'macro_f1': class_report['macro avg']['f1-score'],
+            'confusion_matrix': conf_matrix.tolist()
+        }
+        
+        # Add per-class metrics
+        for class_name, class_metrics in class_report.items():
+            if isinstance(class_metrics, dict) and class_name not in ['macro avg', 'weighted avg']:
+                metrics[f'class_{class_name}_precision'] = class_metrics['precision']
+                metrics[f'class_{class_name}_recall'] = class_metrics['recall']
+                metrics[f'class_{class_name}_f1'] = class_metrics['f1-score']
+        
+    else:
+        # Regression metrics
+        mse = np.mean((np.array(targets) - np.array(predictions)) ** 2)
+        mae = np.mean(np.abs(np.array(targets) - np.array(predictions)))
+        r2 = 1 - (np.sum((np.array(targets) - np.array(predictions)) ** 2) / 
+                  np.sum((np.array(targets) - np.mean(np.array(targets))) ** 2))
+        
+        metrics = {
+            'mse': mse,
+            'rmse': np.sqrt(mse),
+            'mae': mae,
+            'r2': r2
+        }
+    
+    return metrics
+
+def predict_emotions(model, texts, tokenizer, max_length=512):
+    """
+    Predict emotions for a list of texts
+    
+    Args:
+        model: Trained model with emotion module
+        texts: List of text strings
+        tokenizer: Tokenizer for processing text
+        max_length: Maximum sequence length
+        
+    Returns:
+        list: List of emotion predictions dictionaries
+    """
+    model.eval()
+    
+    # Tokenize texts
+    encoded_texts = tokenizer(
+        texts,
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
+    
+    input_ids = encoded_texts['input_ids'].to(device)
+    attention_mask = encoded_texts['attention_mask'].to(device)
+    
+    # Get emotion predictions
+    with torch.no_grad():
+        emotion_preds = model.get_emotion_predictions(input_ids, attention_mask)
+    
+    return emotion_preds
+
+def visualize_emotions(texts, emotion_preds, figsize=(12, 8)):
+    """
+    Visualize emotion predictions for texts
+    
+    Args:
+        texts: List of text strings
+        emotion_preds: List of emotion prediction dictionaries
+        figsize: Figure size
+    """
+    n_samples = len(texts)
+    n_cols = 2
+    n_rows = (n_samples + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    axes = axes.flatten()
+    
+    for i, (text, emotions) in enumerate(zip(texts, emotion_preds)):
+        if i >= len(axes):
+            break
+            
+        # Extract emotions and scores
+        emotion_names = list(emotions.keys())
+        emotion_scores = [emotions[name] for name in emotion_names]
+        
+        # Create bar plot
+        axes[i].bar(emotion_names, emotion_scores, color='skyblue')
+        axes[i].set_ylim(0, 1)
+        axes[i].set_ylabel('Probability')
+        axes[i].set_title(f"Sample {i+1}: '{text[:50]}...'")
+        
+        # Rotate x-axis labels
+        plt.setp(axes[i].get_xticklabels(), rotation=45, ha='right')
+    
+    # Hide unused subplots
+    for i in range(n_samples, len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    return fig
+
+class MentalHealthDataProcessor:
+    """
+    Class for processing mental health data from various sources and formats
+    """
+    def __init__(self, data_dir='data', save_processed=True):
+        self.data_dir = data_dir
+        self.save_processed = save_processed
+        
+        # Create data directory if it doesn't exist
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # Initialize emotion feature extractor
+        self.emotion_extractor = EmotionFeatureExtractor()
+    
+    def load_and_process_data(self, filepath, target_column=None, text_columns=None, 
+                              feature_columns=None, task_type=None, test_size=0.2):
+        """
+        Load and process data from file
+        
+        Args:
+            filepath: Path to data file
+            target_column: Name of target column
+            text_columns: List of text column names
+            feature_columns: List of feature column names
+            task_type: 'classification' or 'regression'
+            test_size: Proportion of data to use for testing
+            
+        Returns:
+            tuple: (train_dataset, test_dataset, data_info)
+        """
+        # Load data
+        if filepath.endswith('.csv'):
+            df = pd.read_csv(filepath)
+        elif filepath.endswith('.json'):
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                df = pd.DataFrame(data)
+            else:
+                df = pd.json_normalize(data)
+        elif filepath.endswith('.xlsx') or filepath.endswith('.xls'):
+            df = pd.read_excel(filepath)
+        elif filepath.endswith('.tsv'):
+            df = pd.read_csv(filepath, sep='\t')
+        else:
+            raise ValueError(f"Unsupported file format: {filepath}")
+        
+        logger.info(f"Loaded {len(df)} samples with {len(df.columns)} columns")
+        
+        # Auto-detect columns if not specified
+        if target_column is None or text_columns is None or feature_columns is None:
+            target_column, text_columns, feature_columns = self.auto_detect_columns(df)
+        
+        # Determine task type if not specified
+        if task_type is None:
+            if df[target_column].dtype == 'object' or len(df[target_column].unique()) < 10:
+                task_type = 'classification'
+            else:
+                task_type = 'regression'
+        
+        logger.info(f"Task type: {task_type}")
+        logger.info(f"Target column: {target_column}")
+        logger.info(f"Text columns: {text_columns}")
+        logger.info(f"Feature columns: {feature_columns}")
+        
+        # Extract emotion features from text
+        if text_columns:
+            df = self.extract_emotion_features(df, text_columns)
+            
+            # Add emotion features to feature columns
+            emotion_feature_cols = [col for col in df.columns if col.startswith('emotion_')]
+            feature_columns = feature_columns + emotion_feature_cols
+        
+        # Split data into train and test sets
+        train_df, test_df = train_test_split(df, test_size=test_size, random_state=42)
+        
+        # Save processed data if required
+        if self.save_processed:
+            train_df.to_csv(os.path.join(self.data_dir, 'train_processed.csv'), index=False)
+            test_df.to_csv(os.path.join(self.data_dir, 'test_processed.csv'), index=False)
+        
+        # Create datasets
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        
+        train_dataset = self.create_dataset(train_df, target_column, text_columns, 
+                                          feature_columns, task_type, tokenizer)
+        test_dataset = self.create_dataset(test_df, target_column, text_columns, 
+                                         feature_columns, task_type, tokenizer)
+        
+        # Prepare data info
+        data_info = {
+            'task_type': task_type,
+            'target_column': target_column,
+            'text_columns': text_columns,
+            'feature_columns': feature_columns,
+            'num_features': len(feature_columns),
+            'num_classes': len(df[target_column].unique()) if task_type == 'classification' else 1,
+            'class_names': df[target_column].unique().tolist() if task_type == 'classification' else None
+        }
+        
+        return train_dataset, test_dataset, data_info
+    
+    def auto_detect_columns(self, df):
+        """Auto-detect target, text, and feature columns"""
+        # Common target column names
+        target_candidates = ['target', 'label', 'sentiment', 'mental_health_score', 
+                           'wellbeing', 'depression', 'anxiety', 'stress', 'emotion',
+                           'mood', 'affect', 'psychological_state', 'mental_state']
+        
+        target_column = None
+        text_columns = []
+        numerical_columns = []
+        categorical_columns = []
+        
+        for col in df.columns:
+            # Check if column might be target
+            if col.lower() in target_candidates and target_column is None:
+                target_column = col
+                continue
+                
+            # Sample values from the column
+            sample_values = df[col].sample(min(100, len(df))).tolist()
+            
+            # Check if column appears to contain text
+            if df[col].dtype == 'object':
+                # Check if this might be a text column
+                text_length = np.mean([len(str(x)) for x in sample_values if isinstance(x, str)])
+                if text_length > 20:  # Longer texts are probably actual content
+                    text_columns.append(col)
+                else:
+                    categorical_columns.append(col)
+            # Check if column is numerical
+            elif np.issubdtype(df[col].dtype, np.number):
+                numerical_columns.append(col)
+            else:
+                # Try to convert to numerical
+                try:
+                    df[col] = pd.to_numeric(df[col])
+                    numerical_columns.append(col)
+                except:
+                    categorical_columns.append(col)
+        
+        # If no target column found, try to guess based on column name
+        if target_column is None:
+            for col in df.columns:
+                if any(keyword in col.lower() for keyword in ['score', 'label', 'target', 'class', 'sentiment', 'emotion']):
+                    target_column = col
+                    if col in numerical_columns:
+                        numerical_columns.remove(col)
+                    elif col in categorical_columns:
+                        categorical_columns.remove(col)
+                    elif col in text_columns:
+                        text_columns.remove(col)
+                    break
+        
+        # If still no target found, use the last column
+        if target_column is None:
+            target_column = df.columns[-1]
+            logger.warning(f"No clear target column found, using {target_column} as target")
+            if target_column in numerical_columns:
+                numerical_columns.remove(target_column)
+            elif target_column in categorical_columns:
+                categorical_columns.remove(target_column)
+            elif target_column in text_columns:
+                text_columns.remove(target_column)
+        
+        # Combine numerical and categorical columns for features
+        feature_columns = numerical_columns + categorical_columns
+        
+        return target_column, text_columns, feature_columns
+    
+    def extract_emotion_features(self, df, text_columns):
+        """Extract emotion features from text columns"""
+        logger.info("Extracting emotion features from text data...")
+        
+        # Combine all text columns
+        combined_text = df[text_columns].apply(
+            lambda row: ' '.join([str(row[col]) for col in text_columns if pd.notna(row[col])]), 
+            axis=1
+        )
+        
+        # Extract features for each text
+        emotion_features = []
+        for text in tqdm(combined_text, desc="Extracting emotion features"):
+            features = self.emotion_extractor.extract_features(text)
+            emotion_features.append(features)
+        
+        # Convert to DataFrame
+        emotion_df = pd.DataFrame(emotion_features)
+        
+        # Add to original DataFrame
+        for col in emotion_df.columns:
+            df[f'emotion_{col}'] = emotion_df[col]
+        
+        logger.info(f"Added {len(emotion_df.columns)} emotion-related features")
+        
+        return df
+    
+    def create_dataset(self, df, target_column, text_columns, feature_columns, task_type, tokenizer):
+        """Create a dataset from DataFrame"""
+        # Process features
+        if feature_columns:
+            # Handle categorical features
+            for col in feature_columns:
+                if df[col].dtype == 'object':
+                    df[col] = pd.Categorical(df[col]).codes
+            
+            features = df[feature_columns].values
+            
+            # Normalize numerical features
+            numerical_cols = [col for col in feature_columns if np.issubdtype(df[col].dtype, np.number)]
+            if numerical_cols:
+                num_features = df[numerical_cols].values
+                num_features = (num_features - np.mean(num_features, axis=0)) / (np.std(num_features, axis=0) + 1e-8)
+                df[numerical_cols] = num_features
+                features = df[feature_columns].values
+        else:
+            features = None
+        
+        # Process texts
+        if text_columns:
+            # Combine all text columns into one text field
+            texts = df[text_columns].apply(
+                lambda row: ' '.join([str(row[col]) for col in text_columns if pd.notna(row[col])]), 
+                axis=1
+            ).tolist()
+        else:
+            texts = None
+        
+        # Process targets
+        if task_type == 'classification':
+            # Convert target to numerical labels
+            label_mapping = {label: i for i, label in enumerate(df[target_column].unique())}
+            labels = np.array([label_mapping[label] for label in df[target_column]])
+        else:
+            labels = df[target_column].values
+        
+        # Create a custom dataset
+        class CustomDataset(Dataset):
+            def __init__(self, texts, features, labels, tokenizer, max_length=512, task_type='classification'):
+                self.texts = texts
+                self.features = features
+                self.labels = labels
+                self.tokenizer = tokenizer
+                self.max_length = max_length
+                self.task_type = task_type
+            
+            def __len__(self):
+                return len(self.labels)
+            
+            def __getitem__(self, idx):
+                item = {}
+                
+                # Add features if available
+                if self.features is not None:
+                    item['features'] = torch.tensor(self.features[idx], dtype=torch.float32)
+                
+                # Add text if available
+                if self.texts is not None:
+                    text = self.texts[idx]
+                    encoded_text = self.tokenizer(
+                        text,
+                        padding='max_length',
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors='pt'
+                    )
+                    item['input_ids'] = encoded_text['input_ids'].squeeze()
+                    item['attention_mask'] = encoded_text['attention_mask'].squeeze()
+                
+                # Add target
+                if self.task_type == 'classification':
+                    item['label'] = torch.tensor(self.labels[idx], dtype=torch.long)
+                else:
+                    item['target'] = torch.tensor(self.labels[idx], dtype=torch.float32)
+                
+                return item
+        
+        return CustomDataset(texts, features, labels, tokenizer, task_type=task_type)
+
+def run_experiment(data_path, model_type="ContextualEmotionLLM", batch_size=16, 
+                  epochs=10, learning_rate=0.0001, save_results=True):
+    """
+    Run a complete experiment from data loading to model evaluation
+    
+    Args:
+        data_path: Path to the data file
+        model_type: Type of model to use
+        batch_size: Batch size for training
+        epochs: Number of training epochs
+        learning_rate: Learning rate
+        save_results: Whether to save results
+        
+    Returns:
+        tuple: (trained_model, evaluation_results)
+    """
+    # Process data
+    processor = MentalHealthDataProcessor()
+    train_dataset, test_dataset, data_info = processor.load_and_process_data(data_path)
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # Create model
+    if model_type == "ContextualEmotionLLM":
+        model = ContextualEmotionLLM(
+            num_features=data_info['num_features'],
+            num_classes=data_info['num_classes'],
+            llm_model_name="bert-base-uncased",
+            hidden_dim=256,
+            dropout_rate=0.2,
+            use_emotion_module=True
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    # Train model
+    model, history = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        epochs=epochs, 
+        lr=learning_rate, 
+        task=data_info['task_type'],
+        use_emotional_loss=True
+    )
+    
+    # Evaluate on test set
+    if data_info['task_type'] == 'classification':
+        criterion = nn.CrossEntropyLoss(reduction='none')
+    else:
+        criterion = nn.MSELoss(reduction='none')
+    
+    test_loss, test_metrics = evaluate_model(model, test_loader, criterion, data_info['task_type'])
+    
+    # Prepare results
+    results = {
+        'test_loss': test_loss,
+        'test_metrics': test_metrics,
+        'training_history': history,
+        'data_info': data_info
+    }
+    
+    logger.info(f"Test Loss: {test_loss:.4f}")
+    logger.info(f"Test Metrics: {test_metrics}")
+    
+    # Save results if required
+    if save_results:
+        # Save model
+        torch.save(model.state_dict(), 'mental_health_model.pt')
+        
+        # Save results
+        with open('experiment_results.json', 'w') as f:
+            json.dump(results, f, indent=4)
+    
+    return model, results
+
+def analyze_model_predictions(model, test_dataset, batch_size=16):
+    """
+    Analyze model predictions on test data
+    
+    Args:
+        model: Trained model
+        test_dataset: Test dataset
+        batch_size: Batch size for evaluation
+        
+    Returns:
+        dict: Analysis results
+    """
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    model = model.to(device)
+    model.eval()
+    
+    all_preds = []
+    all_targets = []
+    all_emotions = []
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Analyzing predictions"):
+            # Move data to device
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            
+            # Get model inputs
+            model_inputs = {}
+            if 'input_ids' in batch:
+                model_inputs['input_ids'] = batch['input_ids']
+                model_inputs['attention_mask'] = batch['attention_mask']
+                
+                # Get emotion predictions
+                emotions = model.get_emotion_predictions(
+                    batch['input_ids'], 
+                    batch['attention_mask']
+                )
+                all_emotions.extend(emotions)
+            
+            if 'features' in batch:
+                model_inputs['features'] = batch['features']
+            
+            # Get targets
+            if 'label' in batch:
+                targets = batch['label']
+                task = 'classification'
+            else:
+                targets = batch['target']
+                task = 'regression'
+            
+            model_inputs['task'] = task
+            
+            # Forward pass
+            outputs = model(**model_inputs)
+            
+            # Process predictions
+            if task == 'classification':
+                preds = torch.argmax(outputs, dim=1)
+            else:
+                preds = outputs.squeeze()
+            
+            # Store predictions and targets
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+    
+    # Prepare analysis results
+    results = {
+        'predictions': all_preds,
+        'targets': all_targets,
+        'emotions': all_emotions
+    }
+    
+    # Add confusion matrix for classification
+    if task == 'classification':
+        conf_matrix = confusion_matrix(all_targets, all_preds)
+        results['confusion_matrix'] = conf_matrix.tolist()
+        
+        # Visualize confusion matrix
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title('Confusion Matrix')
+        plt.savefig('confusion_matrix.png')
+        
+    # Analyze emotion patterns
+    if all_emotions:
+        # Create emotion correlation analysis
+        emotion_df = pd.DataFrame([
+            {emotion: scores[emotion] for emotion in scores} 
+            for scores in all_emotions
+        ])
+        
+        # Add predictions and targets
+        emotion_df['prediction'] = all_preds
+        emotion_df['target'] = all_targets
+        
+        # Calculate correlations
+        corr_matrix = emotion_df.corr()
+        
+        # Visualize correlations
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1)
+        plt.title('Correlation Matrix of Emotions and Predictions')
+        plt.savefig('emotion_correlations.png')
+        
+        results['emotion_correlations'] = corr_matrix.to_dict()
+    
+    return results
+
+if __name__ == "__main__":
+    # Example usage
+    parser = argparse.ArgumentParser(description='Mental Health Text Analysis')
+    parser.add_argument('--data_path', type=str, required=True, help='Path to the data file')
+    parser.add_argument('--model_type', type=str, default='ContextualEmotionLLM', help='Type of model to use')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--save_results', action='store_true', help='Whether to save results')
+    
+    args = parser.parse_args()
+    
+    # Run experiment
+    model, results = run_experiment(
+        data_path=args.data_path,
+        model_type=args.model_type,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        learning_rate=args.lr,
+        save_results=args.save_results
+    )
+    
+    # Print summary
+    logger.info("Experiment completed successfully!")
+    logger.info(f"Test metrics: {results['test_metrics']}")
